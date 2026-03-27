@@ -41,14 +41,19 @@ async function getSheetData(spreadsheetId: string) {
   });
 }
 
-async function writeLog(user: string, action: string, details: string) {
+// Hàm ghi Log đã được bọc chặt chẽ mảng 2 chiều
+async function writeLog(user: string, action: string, details: any) {
   const timestamp = new Date().toISOString();
+  // Ép kiểu details về dạng chuỗi để chống lỗi 1 chiều
+  const safeDetails = typeof details === "object" ? JSON.stringify(details) : String(details || "");
+  
   await sheets.spreadsheets.values.append({
     spreadsheetId: LOG_SPREADSHEET_ID,
     range: "A:D",
     valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: [[timestamp, user, action, details]],
+      // LƯU Ý QUAN TRỌNG: Cặp ngoặc vuông kép [[ ]] ở đây chính là mảng 2 chiều
+      values: [[timestamp, user || "Unknown", action || "Unknown", safeDetails]],
     },
   });
 }
@@ -59,7 +64,6 @@ app.get("/api/data", async (req, res) => {
     const records = await getSheetData(DATA_SPREADSHEET_ID);
     res.json(records);
   } catch (error) {
-    console.error("Lỗi đọc Dataset:", error);
     res.status(500).json({ error: "Failed to read data" });
   }
 });
@@ -68,9 +72,16 @@ app.post("/api/data", async (req, res) => {
   try {
     const { data: newData, user, action, details } = req.body;
     
-    if (newData && newData.length > 0) {
+    // Xử lý ghi Dataset: Kiểm tra kỹ phải là Array và có dữ liệu
+    if (newData && Array.isArray(newData) && newData.length > 0 && Object.keys(newData[0]).length > 0) {
       const headers = Object.keys(newData[0]);
-      const rows = newData.map((item: any) => headers.map(h => item[h]));
+      
+      // Chuyển mảng object thành mảng 2 chiều và ép tất cả giá trị về chuỗi
+      const rows = newData.map((item: any) => headers.map(h => {
+        const val = item[h];
+        return val !== null && val !== undefined ? String(val) : "";
+      }));
+      
       const sheetValues = [headers, ...rows];
 
       await sheets.spreadsheets.values.clear({
@@ -82,15 +93,23 @@ app.post("/api/data", async (req, res) => {
         spreadsheetId: DATA_SPREADSHEET_ID,
         range: "A1",
         valueInputOption: "USER_ENTERED",
-        requestBody: { values: sheetValues },
+        requestBody: { 
+          majorDimension: "ROWS",
+          values: sheetValues 
+        },
       });
     }
     
-    if (user && action) await writeLog(user, action, details || "");
+    // Xử lý ghi Log
+    if (user || action) {
+      await writeLog(user, action, details);
+    }
+    
     res.json({ message: "Data saved successfully" });
-  } catch (error) {
-    console.error("Lỗi ghi Dataset:", error);
-    res.status(500).json({ error: "Failed to save data" });
+  } catch (error: any) {
+    console.error("Lỗi ghi Google Sheets:", error.message || error);
+    // Trả về thẳng thông báo lỗi để hiển thị lên trình duyệt nếu có lỗi
+    res.status(500).json({ error: "Failed to save data", details: error.message });
   }
 });
 
@@ -106,6 +125,7 @@ app.get("/api/logs", async (req, res) => {
   }
 });
 
+// Giữ nguyên các hàm Export
 app.get("/api/export/data", async (req, res) => {
   try {
     const records = await getSheetData(DATA_SPREADSHEET_ID);
@@ -133,5 +153,4 @@ app.get("/api/export/logs", async (req, res) => {
   }
 });
 
-// LỆNH QUAN TRỌNG NHẤT ĐỂ VERCEL HIỂU ĐÂY LÀ BACKEND
 export default app;
