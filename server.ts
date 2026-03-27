@@ -1,44 +1,80 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import fs from "fs/promises";
-import { parse } from "csv-parse/sync";
-import { stringify } from "csv-stringify/sync";
 import { createServer as createViteServer } from "vite";
 import cors from "cors";
+import { google } from "googleapis";
+import { stringify } from "csv-stringify/sync";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const CSV_FILE = path.join(__dirname, "dataset.csv");
-const LOG_FILE = path.join(__dirname, "activity_log.csv");
+// --- CẤU HÌNH GOOGLE SHEETS API VỚI 2 LINK RIÊNG BIỆT ---
+const LOG_SPREADSHEET_ID = "1Muqg0jhFinGl-loI7Vlkyf9d4qdMOgwtLT7gZhVmfoQ";
+const DATA_SPREADSHEET_ID = "1FJ64lBMg-3ubBzA7hXFtD4aFEzEKQgLX10atFXCAiDY";
 
+const auth = new google.auth.GoogleAuth({
+  credentials: {
+    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    // Xử lý ký tự xuống dòng (\n) cho private key khi chạy trên Vercel
+    private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+  },
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+});
+
+const sheets = google.sheets({ version: "v4", auth });
+
+// --- CÁC HÀM HỖ TRỢ ĐỌC/GHI GOOGLE SHEETS ---
+
+// Hàm đọc dữ liệu từ Sheet (truyền vào ID của file tương ứng)
+// Sử dụng dải ô "A:Z" sẽ tự động lấy dữ liệu ở Sheet (Trang tính) đầu tiên
+async function getSheetData(spreadsheetId: string) {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: spreadsheetId,
+    range: "A:Z", 
+  });
+  
+  const rows = response.data.values;
+  if (!rows || rows.length === 0) return [];
+  
+  const headers = rows[0];
+  return rows.slice(1).map(row => {
+    const obj: any = {};
+    headers.forEach((header, i) => {
+      obj[header] = row[i] || "";
+    });
+    return obj;
+  });
+}
+
+// Hàm ghi Log nối tiếp vào cuối file Activity Log
 async function writeLog(user: string, action: string, details: string) {
   const timestamp = new Date().toISOString();
-  const logEntry = { timestamp, user, action, details };
-  const exists = await fs.access(LOG_FILE).then(() => true).catch(() => false);
-  const csvLine = stringify([logEntry], { header: !exists });
-  await fs.appendFile(LOG_FILE, csvLine);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: LOG_SPREADSHEET_ID,
+    range: "A:D", // Cột A: Thời gian, B: User, C: Hành động, D: Chi tiết
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [[timestamp, user, action, details]],
+    },
+  });
 }
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   app.use(cors());
   app.use(express.json());
 
-  // API Routes
+  // --- API ROUTES ---
+
   app.get("/api/data", async (req, res) => {
     try {
-      const fileContent = await fs.readFile(CSV_FILE, "utf-8");
-      const records = parse(fileContent, {
-        columns: true,
-        skip_empty_lines: true,
-      });
+      const records = await getSheetData(DATA_SPREADSHEET_ID);
       res.json(records);
     } catch (error) {
-      console.error("Error reading CSV:", error);
+      console.error("Lỗi đọc Dataset:", error);
       res.status(500).json({ error: "Failed to read data" });
     }
   });
@@ -46,8 +82,26 @@ async function startServer() {
   app.post("/api/data", async (req, res) => {
     try {
       const { data: newData, user, action, details } = req.body;
-      const output = stringify(newData, { header: true });
-      await fs.writeFile(CSV_FILE, output);
+      
+      if (newData && newData.length > 0) {
+        const headers = Object.keys(newData[0]);
+        const rows = newData.map((item: any) => headers.map(h => item[h]));
+        const sheetValues = [headers, ...rows];
+
+        // 1. Xóa dữ liệu cũ trên file Dataset
+        await sheets.spreadsheets.values.clear({
+          spreadsheetId: DATA_SPREADSHEET_ID,
+          range: "A:Z",
+        });
+
+        // 2. Ghi đè dữ liệu mới vào file Dataset
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: DATA_SPREADSHEET_ID,
+          range: "A1",
+          valueInputOption: "USER_ENTERED",
+          requestBody: { values: sheetValues },
+        });
+      }
       
       if (user && action) {
         await writeLog(user, action, details || "");
@@ -55,62 +109,50 @@ async function startServer() {
       
       res.json({ message: "Data saved successfully" });
     } catch (error) {
-      console.error("Error writing CSV:", error);
+      console.error("Lỗi ghi Dataset:", error);
       res.status(500).json({ error: "Failed to save data" });
     }
   });
 
   app.get("/api/logs", async (req, res) => {
     const role = req.headers["x-user-role"];
-    if (role !== "ADMIN") {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
+    if (role !== "ADMIN") return res.status(403).json({ error: "Unauthorized" });
 
     try {
-      const exists = await fs.access(LOG_FILE).then(() => true).catch(() => false);
-      if (!exists) return res.json([]);
-      
-      const fileContent = await fs.readFile(LOG_FILE, "utf-8");
-      const logs = parse(fileContent, {
-        columns: true,
-        skip_empty_lines: true,
-      });
+      const logs = await getSheetData(LOG_SPREADSHEET_ID);
       res.json(logs);
     } catch (error) {
-      console.error("Error reading logs:", error);
+      console.error("Lỗi đọc logs:", error);
       res.status(500).json({ error: "Failed to read logs" });
     }
   });
 
+  // Export CSV cho Frontend tải về
   app.get("/api/export/data", async (req, res) => {
     try {
-      const content = await fs.readFile(CSV_FILE, "utf-8");
+      const records = await getSheetData(DATA_SPREADSHEET_ID);
+      const csvContent = stringify(records, { header: true });
       const bom = "\uFEFF";
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", "attachment; filename=dataset.csv");
-      res.send(bom + content);
+      res.send(bom + csvContent);
     } catch (error) {
-      console.error("Export error:", error);
       res.status(500).send("Export failed");
     }
   });
 
   app.get("/api/export/logs", async (req, res) => {
     const role = req.headers["x-user-role"];
-    if (role !== "ADMIN") {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
+    if (role !== "ADMIN") return res.status(403).json({ error: "Unauthorized" });
+
     try {
-      const exists = await fs.access(LOG_FILE).then(() => true).catch(() => false);
-      if (!exists) return res.status(404).send("Log file not found");
-      
-      const content = await fs.readFile(LOG_FILE, "utf-8");
+      const logs = await getSheetData(LOG_SPREADSHEET_ID);
+      const csvContent = stringify(logs, { header: true });
       const bom = "\uFEFF";
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", "attachment; filename=activity_log.csv");
-      res.send(bom + content);
+      res.send(bom + csvContent);
     } catch (error) {
-      console.error("Export error:", error);
       res.status(500).send("Export failed");
     }
   });
